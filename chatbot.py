@@ -15,7 +15,7 @@ HEADERS = {"Authorization": f"Bearer {HUGGINGFACE_API_KEY}"}
 
 app = Flask(__name__)
 app.secret_key = 'supersecretkey'  # Needed for session tracking
-CORS(app, resources={r"/chat": {"origins": "https://neurosaarthi.com"}})
+CORS(app, origins="*")
 
 ROLE_CONTEXT = {
     "parent": "You are helping a parent who is worried about their neurodiverse child.",
