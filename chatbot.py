@@ -2,6 +2,7 @@ import os
 import json
 import requests
 import random
+import io
 from flask import Flask, request, jsonify, session
 from flask_cors import CORS
 from textblob import TextBlob
@@ -9,10 +10,10 @@ from datetime import datetime
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-# 🔐 Securely load Firebase credentials from environment variable
+# 🔐 Load Firebase credentials from environment variable (escaped JSON string for Render)
 firebase_json = os.getenv("FIREBASE_CREDENTIALS_JSON")
-cred_dict = json.loads(firebase_json)
-cred = credentials.Certificate(cred_dict)
+cred_file = io.StringIO(firebase_json)
+cred = credentials.Certificate(cred_file)
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
@@ -21,10 +22,12 @@ HUGGINGFACE_API_URL = "https://api-inference.huggingface.co/models/mistralai/Mis
 HUGGINGFACE_API_KEY = os.getenv("HF_API_KEY")
 HEADERS = {"Authorization": f"Bearer {HUGGINGFACE_API_KEY}"}
 
+# Flask app
 app = Flask(__name__)
 app.secret_key = 'supersecretkey'
 CORS(app, origins="*")
 
+# Role-based context
 ROLE_CONTEXT = {
     "parent": "You are helping a parent who is worried about their neurodiverse child. Answer with clarity and kindness.",
     "teacher": "You are supporting a teacher who wants to create a kind, inclusive classroom. Be practical and empathetic.",
@@ -33,6 +36,7 @@ ROLE_CONTEXT = {
     "general": "You are a helpful and supportive assistant. Keep responses friendly, empathetic, and informative."
 }
 
+# Firestore logging
 def log_to_firestore(sender, message, role, flag_score=None, flag_label=None):
     entry = {
         "sender": sender,
@@ -44,9 +48,9 @@ def log_to_firestore(sender, message, role, flag_score=None, flag_label=None):
         entry["flag_score"] = flag_score
     if flag_label:
         entry["flag_label"] = flag_label
-
     db.collection("chatLogs").add(entry)
 
+# Behavior flag detection
 def flag_behavior(user_input):
     classification_url = "https://api-inference.huggingface.co/models/facebook/bart-large-mnli"
     categories = ["overwhelm", "confusion", "focus issue", "neutral"]
@@ -78,10 +82,12 @@ def flag_behavior(user_input):
 
     return total_score
 
+# Sentiment analysis
 def analyze_sentiment(user_input):
     blob = TextBlob(user_input)
     return blob.sentiment.polarity
 
+# Chat logic
 def get_gpt_response(user_input, user_role):
     if user_input.lower().strip() in ["hi", "hello", "hey"]:
         return "👋 Hello! I'm here to listen and support you. What's on your mind today?"
@@ -136,6 +142,7 @@ def get_gpt_response(user_input, user_role):
     except Exception as e:
         return f"An error occurred: {str(e)}"
 
+# Main chat route
 @app.route("/chat", methods=["POST"])
 def chat():
     user_input = request.json.get("message")
@@ -152,6 +159,7 @@ def chat():
 
     return jsonify({"response": response})
 
+# Analyze logs and trigger alerts
 @app.route("/analyze", methods=["POST"])
 def analyze_logs():
     logs = db.collection("chatLogs").order_by("timestamp", direction=firestore.Query.DESCENDING).limit(100).stream()
@@ -180,6 +188,7 @@ def analyze_logs():
 
     return jsonify({"message": "Analysis completed", "alerts_triggered": alerts})
 
+# Reset session
 @app.route("/reset", methods=["POST"])
 def reset_convo():
     session["history"] = []
@@ -189,6 +198,7 @@ def reset_convo():
     session["last_detected_flag"] = None
     return jsonify({"message": "Session reset"})
 
+# Start server
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(debug=False, host="0.0.0.0", port=port)
