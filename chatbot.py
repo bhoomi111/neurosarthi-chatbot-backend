@@ -12,8 +12,8 @@ from firebase_admin import credentials, firestore
 
 # 🔐 Load Firebase credentials from environment variable (escaped JSON string for Render)
 firebase_json = os.getenv("FIREBASE_CREDENTIALS_JSON")
-cred_file = io.StringIO(firebase_json)
-cred = credentials.Certificate(cred_file)
+cred_dict = json.loads(firebase_json)
+cred = credentials.Certificate(cred_dict)
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
