@@ -18,76 +18,76 @@ app.secret_key = 'supersecretkey'  # Needed for session tracking
 CORS(app, origins="*")
 
 ROLE_CONTEXT = {
-    "parent": "You are helping a parent who is worried about their neurodiverse child.",
-    "teacher": "You are supporting a teacher who wants to create a kind, inclusive classroom.",
-    "mentor": "You are assisting a mentor who guides neurodiverse youth emotionally.",
-    "individual": "You are talking to someone who is neurodiverse and looking for support.",
-    "general": "You are helping someone who wants to better understand neurodiversity."
+    "parent": "You are helping a parent who is worried about their neurodiverse child. Answer with clarity and kindness.",
+    "teacher": "You are supporting a teacher who wants to create a kind, inclusive classroom. Be practical and empathetic.",
+    "mentor": "You are assisting a mentor who guides neurodiverse youth emotionally. Be thoughtful and calm.",
+    "individual": "You are talking to someone who is neurodiverse and looking for support. Be validating and gentle.",
+    "general": "You are a helpful and supportive assistant. Keep responses friendly, empathetic, and informative."
 }
 
-# Emotional starters
-empathetic_starters = [
-    "I hear you. 💙",
-    "That sounds really tough.",
-    "You're not alone in this.",
-    "It’s okay to feel this way.",
-    "Thank you for sharing that with me.",
-    "I'm here for you."
-]
-
-# Detect behavior flags from message
+# Smarter behavior detection using zero-shot classification
 def flag_behavior(user_input):
-    flags = {
-        "overwhelm": ["i can't", "i feel", "i'm tired", "i'm stressed", "i'm overwhelmed", "too much", "exhausted"],
-        "confusion": ["i don't understand", "i'm confused", "what do you mean", "explain again"],
-        "focus": ["can't focus", "distracted", "hard to pay attention", "forget", "mind wanders"],
-        "repetition": [],  # handled separately
+    classification_url = "https://api-inference.huggingface.co/models/facebook/bart-large-mnli"
+    categories = ["overwhelm", "confusion", "focus issue", "neutral"]
+
+    payload = {
+        "inputs": user_input,
+        "parameters": {"candidate_labels": categories}
     }
 
-    score = 0
-    lowered = user_input.lower()
+    response = requests.post(classification_url, headers=HEADERS, json=payload)
+    result = response.json()
 
-    for category, phrases in flags.items():
-        for phrase in phrases:
-            if phrase in lowered:
-                score += 2 if category != "repetition" else 1
+    top_label = result["labels"][0]
+    score = result["scores"][0] if top_label != "neutral" else 0
 
-    # Repetition flag: check against previous inputs
     previous_inputs = session.get("inputs", [])
     similar = [msg for msg in previous_inputs if msg == user_input]
     if len(similar) >= 1:
-        score += 2
+        score += 0.5
 
     previous_inputs.append(user_input)
-    session["inputs"] = previous_inputs[-10:]  # Keep last 10 inputs
+    session["inputs"] = previous_inputs[-10:]
 
     total_score = session.get("flag_score", 0) + score
     session["flag_score"] = total_score
 
+    if total_score >= 8 and not session.get("neuro_flagged", False):
+        session["neuro_flagged"] = True
+
     return total_score
 
-# Sentiment scoring
 def analyze_sentiment(user_input):
     blob = TextBlob(user_input)
     return blob.sentiment.polarity
 
-# Chat logic
 def get_gpt_response(user_input, user_role):
+    if user_input.lower().strip() in ["hi", "hello", "hey"]:
+        return "👋 Hello! I'm here to listen and support you. What's on your mind today?"
+
     sentiment = analyze_sentiment(user_input)
     total_flags = flag_behavior(user_input)
 
-    tone = "Speak gently and supportively, like a kind therapist. Use short, caring sentences when needed."
+    tone = "You are a kind, emotionally intelligent assistant. Respond empathetically, understand the user's feelings, and provide supportive, helpful answers that feel natural and thoughtful."
     if sentiment < -0.3:
-        tone += " The user might be feeling overwhelmed or upset. Focus on calming and reassuring them."
+        tone += " The user might be feeling overwhelmed. Validate their emotions gently and be calming."
     elif sentiment > 0.3:
-        tone += " The user seems hopeful. Encourage and nurture that feeling."
+        tone += " The user seems encouraged. Reinforce that optimism and confidence."
 
     role_intro = ROLE_CONTEXT.get(user_role.lower(), ROLE_CONTEXT["general"])
+
+    history = session.get("history", [])
+    history.append({"role": "user", "content": user_input})
+
+    formatted_history = "\n".join([
+        f"User: {entry['content']}" if entry["role"] == "user" else f"Assistant: {entry['content']}"
+        for entry in history
+    ])
 
     prompt = (
         f"{role_intro}\n"
         f"{tone}\n"
-        f"User: {user_input}\n"
+        f"{formatted_history}\n"
         f"Assistant:"
     )
 
@@ -103,23 +103,14 @@ def get_gpt_response(user_input, user_role):
         if isinstance(result, list) and "generated_text" in result[0]:
             response_text = result[0]["generated_text"].split("Assistant:")[-1].strip()
 
-            # Check for emotional triggers
-            emotional_trigger_phrases = [
-                "i feel", "i’m feeling", "i'm feeling", "i am struggling", "i'm struggling",
-                "i need help", "i'm overwhelmed", "i'm tired", "i can't", "i don't know how",
-                "i’m worried", "i'm scared", "i'm anxious"
-            ]
-            is_emotional = any(phrase in user_input.lower() for phrase in emotional_trigger_phrases)
-
-            if is_emotional and not any(response_text.lower().startswith(starter.lower()) for starter in empathetic_starters):
-                response_text = f"{random.choice(empathetic_starters)} {response_text}"
-
-            # Append soft suggestion if flags are high
-            if total_flags >= 8:
+            if total_flags >= 8 and not session.get("neuro_flagged", False):
                 response_text += "\n\n🧠 It seems like you might be facing some challenges that could be related to neurodiverse traits. Would you like to explore this gently together?"
 
             if len(response_text) > 700:
                 response_text = response_text[:680].rsplit('.', 1)[0] + "..."
+
+            history.append({"role": "assistant", "content": response_text})
+            session["history"] = history[-6:]
 
             return response_text
 
@@ -142,8 +133,15 @@ def chat():
     response = get_gpt_response(user_input, user_role)
     return jsonify({"response": response})
 
+@app.route("/reset", methods=["POST"])
+def reset_convo():
+    session["history"] = []
+    session["flag_score"] = 0
+    session["inputs"] = []
+    session["neuro_flagged"] = False
+    return jsonify({"message": "Session reset"})
+
 if __name__ == "__main__":
     import os
     port = int(os.environ.get("PORT", 5000))
     app.run(debug=False, host="0.0.0.0", port=port)
-
