@@ -3,3 +3,4 @@ flask-cors
 requests
 textblob
 python-dotenv
+firebase-admin
