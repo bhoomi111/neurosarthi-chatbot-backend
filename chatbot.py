@@ -1,20 +1,28 @@
 import os
+import json
 import requests
 import random
 from flask import Flask, request, jsonify, session
 from flask_cors import CORS
 from textblob import TextBlob
-from dotenv import load_dotenv
+from datetime import datetime
+import firebase_admin
+from firebase_admin import credentials, firestore
 
-# Load API key from .env
-load_dotenv()
+# 🔐 Securely load Firebase credentials from environment variable
+firebase_json = os.getenv("FIREBASE_CREDENTIALS_JSON")
+cred_dict = json.loads(firebase_json)
+cred = credentials.Certificate(cred_dict)
+firebase_admin.initialize_app(cred)
+db = firestore.client()
 
+# Hugging Face setup
 HUGGINGFACE_API_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.1"
 HUGGINGFACE_API_KEY = os.getenv("HF_API_KEY")
 HEADERS = {"Authorization": f"Bearer {HUGGINGFACE_API_KEY}"}
 
 app = Flask(__name__)
-app.secret_key = 'supersecretkey'  # Needed for session tracking
+app.secret_key = 'supersecretkey'
 CORS(app, origins="*")
 
 ROLE_CONTEXT = {
@@ -25,7 +33,20 @@ ROLE_CONTEXT = {
     "general": "You are a helpful and supportive assistant. Keep responses friendly, empathetic, and informative."
 }
 
-# Smarter behavior detection using zero-shot classification
+def log_to_firestore(sender, message, role, flag_score=None, flag_label=None):
+    entry = {
+        "sender": sender,
+        "message": message,
+        "timestamp": datetime.utcnow(),
+        "role": role,
+    }
+    if flag_score is not None:
+        entry["flag_score"] = flag_score
+    if flag_label:
+        entry["flag_label"] = flag_label
+
+    db.collection("chatLogs").add(entry)
+
 def flag_behavior(user_input):
     classification_url = "https://api-inference.huggingface.co/models/facebook/bart-large-mnli"
     categories = ["overwhelm", "confusion", "focus issue", "neutral"]
@@ -41,11 +62,11 @@ def flag_behavior(user_input):
     top_label = result["labels"][0]
     score = result["scores"][0] if top_label != "neutral" else 0
 
-    previous_inputs = session.get("inputs", [])
-    similar = [msg for msg in previous_inputs if msg == user_input]
-    if len(similar) >= 1:
-        score += 0.5
+    session["last_detected_flag"] = top_label if top_label != "neutral" else None
 
+    previous_inputs = session.get("inputs", [])
+    if user_input in previous_inputs:
+        score += 0.5
     previous_inputs.append(user_input)
     session["inputs"] = previous_inputs[-10:]
 
@@ -75,7 +96,6 @@ def get_gpt_response(user_input, user_role):
         tone += " The user seems encouraged. Reinforce that optimism and confidence."
 
     role_intro = ROLE_CONTEXT.get(user_role.lower(), ROLE_CONTEXT["general"])
-
     history = session.get("history", [])
     history.append({"role": "user", "content": user_input})
 
@@ -84,12 +104,7 @@ def get_gpt_response(user_input, user_role):
         for entry in history
     ])
 
-    prompt = (
-        f"{role_intro}\n"
-        f"{tone}\n"
-        f"{formatted_history}\n"
-        f"Assistant:"
-    )
+    prompt = f"{role_intro}\n{tone}\n{formatted_history}\nAssistant:"
 
     payload = {
         "inputs": prompt,
@@ -111,7 +126,6 @@ def get_gpt_response(user_input, user_role):
 
             history.append({"role": "assistant", "content": response_text})
             session["history"] = history[-6:]
-
             return response_text
 
         elif "error" in result:
@@ -130,8 +144,41 @@ def chat():
     if not user_input:
         return jsonify({"error": "Message cannot be empty"}), 400
 
+    log_to_firestore("user", user_input, user_role)
     response = get_gpt_response(user_input, user_role)
+    log_to_firestore("bot", response, user_role,
+                     flag_score=session.get("flag_score"),
+                     flag_label=session.get("last_detected_flag"))
+
     return jsonify({"response": response})
+
+@app.route("/analyze", methods=["POST"])
+def analyze_logs():
+    logs = db.collection("chatLogs").order_by("timestamp", direction=firestore.Query.DESCENDING).limit(100).stream()
+
+    flag_counter = {}
+    alerts = []
+
+    for doc in logs:
+        data = doc.to_dict()
+        if data["sender"] == "user" and "flag_label" in data:
+            user_id = data.get("role", "general")
+            flag = data["flag_label"]
+            key = f"{user_id}:{flag}"
+            flag_counter[key] = flag_counter.get(key, 0) + 1
+
+            if flag_counter[key] == 3:
+                alert = {
+                    "user": user_id,
+                    "flag": flag,
+                    "timestamp": datetime.utcnow(),
+                    "message": f"⚠️ Frequent signs of {flag} detected.",
+                    "type": "behavioral"
+                }
+                alerts.append(alert)
+                db.collection("user_alerts").add(alert)
+
+    return jsonify({"message": "Analysis completed", "alerts_triggered": alerts})
 
 @app.route("/reset", methods=["POST"])
 def reset_convo():
@@ -139,9 +186,9 @@ def reset_convo():
     session["flag_score"] = 0
     session["inputs"] = []
     session["neuro_flagged"] = False
+    session["last_detected_flag"] = None
     return jsonify({"message": "Session reset"})
 
 if __name__ == "__main__":
-    import os
     port = int(os.environ.get("PORT", 5000))
     app.run(debug=False, host="0.0.0.0", port=port)
